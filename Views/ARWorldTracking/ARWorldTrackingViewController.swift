@@ -183,6 +183,7 @@ final class ARWorldTrackingViewController: UIViewController {
     private let horizontalSwitch = UISwitch()
     private let verticalSwitch = UISwitch()
     private let lightEstimationSwitch = UISwitch()
+    private let collisionSwitch = UISwitch()
     private let sessionIDLabel = UILabel()
     private let cameraTransformLabel = UILabel()
     private let cameraOrientationLabel = UILabel()
@@ -190,6 +191,9 @@ final class ARWorldTrackingViewController: UIViewController {
     private let lightEstimateLabel = UILabel()
 
     private var chipGroups: [[UIButton]] = []
+    // Chip group index for the sceneReconstruction chips, so enableLiDARMesh() can
+    // re-select the "mesh" chip programmatically.
+    private var sceneReconstructionChipGroupIndex = 0
     private var isAnchorPanelVisible = false
     private var anchorTypeFilter: String?
     private let maxARAnchorRows = 20
@@ -771,14 +775,37 @@ final class ARWorldTrackingViewController: UIViewController {
 
     @objc private func handleARTap(_ gesture: UITapGestureRecognizer) {
         let point = gesture.location(in: arView)
-        switch viewModel.handleTap(at: point, in: arView) {
-        case .existingAnchor(let info):
-            presentAnchorInfoAlert(info)
-        case .raycastHit(let transform):
-            presentAddAnchorDialog(transform: transform)
-        case .noHit:
-            break
+        showTapRipple(at: point)
+        // Let the tap ripple play before the modal's dimming backdrop covers the AR view.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            guard let self else { return }
+            if let info = self.viewModel.anchorInfoAtTap(at: point, in: self.arView) {
+                self.presentAnchorInfoAlert(info)
+            } else {
+                self.presentRaycastMethodDialog(point: point)
+            }
         }
+    }
+
+    // Brief ripple at the tap location so taps are visible in screen recordings.
+    private func showTapRipple(at point: CGPoint) {
+        let diameter: CGFloat = 44
+        let ripple = UIView(frame: CGRect(x: 0, y: 0, width: diameter, height: diameter))
+        ripple.center = point
+        ripple.backgroundColor = UIColor.systemBlue.withAlphaComponent(0.35)
+        ripple.layer.cornerRadius = diameter / 2
+        ripple.layer.borderWidth = 2
+        ripple.layer.borderColor = UIColor.systemBlue.cgColor
+        ripple.isUserInteractionEnabled = false
+        ripple.transform = CGAffineTransform(scaleX: 0.5, y: 0.5)
+        arView.addSubview(ripple)
+
+        UIView.animate(withDuration: 0.45, delay: 0, options: [.curveEaseOut], animations: {
+            ripple.transform = CGAffineTransform(scaleX: 1.6, y: 1.6)
+            ripple.alpha = 0
+        }, completion: { _ in
+            ripple.removeFromSuperview()
+        })
     }
 
     @objc private func handleOverlayPan(_ gesture: UIPanGestureRecognizer) {
@@ -811,16 +838,64 @@ final class ARWorldTrackingViewController: UIViewController {
     private func presentAnchorInfoAlert(_ info: AnchorTapInfo) {
         let alert = UIAlertController(
             title: info.name,
-            message: "UUID: \(info.uuid.uuidString)\nTransform: \(info.transformDescription)",
+            message: "UUID: \(info.uuid?.uuidString ?? "-")\nTransform: \(info.transformDescription)",
             preferredStyle: .alert
         )
         alert.addAction(UIAlertAction(title: "OK", style: .default))
         present(alert, animated: true)
     }
 
-    private func presentAddAnchorDialog(transform: simd_float4x4) {
-        let dialog = AddAnchorViewController(transform: transform) { [weak self] name, useARAnchor in
-            self?.viewModel.addUserAnchor(name: name, transform: transform, useARAnchor: useARAnchor)
+    // Step 1: choose the raycast method. "with LiDAR mesh" turns on scene reconstruction
+    // and mesh collision (and reruns the session). Methods that take an
+    // ARRaycastQuery.Target continue to the target dialog; the rest raycast right away.
+    private func presentRaycastMethodDialog(point: CGPoint) {
+        let dialog = RaycastMethodViewController { [weak self] method in
+            guard let self else { return }
+            if method == .sceneRaycastLiDAR {
+                self.viewModel.enableLiDARMesh()
+                self.syncLiDARControls()
+            }
+            if method.usesRaycastTarget {
+                self.presentRaycastTargetDialog(point: point, method: method)
+            } else {
+                self.beginRaycast(point: point, method: method, target: .estimatedPlane)
+            }
+        }
+        present(dialog, animated: true)
+    }
+
+    // Reflects the state enableLiDARMesh() set in the overlay: collision on and the
+    // sceneReconstruction "mesh" chip selected.
+    private func syncLiDARControls() {
+        collisionSwitch.setOn(true, animated: true)
+        selectChip(groupIndex: sceneReconstructionChipGroupIndex, selectedIndex: 1)
+    }
+
+    // Step 2 (only for methods that use one): choose the ARRaycastQuery.Target.
+    private func presentRaycastTargetDialog(point: CGPoint, method: RaycastMethod) {
+        let dialog = RaycastTargetViewController { [weak self] target in
+            self?.beginRaycast(point: point, method: method, target: target)
+        }
+        present(dialog, animated: true)
+    }
+
+    // Runs the raycast, then presents the Add Anchor dialog showing the result.
+    private func beginRaycast(point: CGPoint, method: RaycastMethod, target: ARRaycastQuery.Target) {
+        viewModel.raycast(method: method, target: target, at: point) { [weak self] transform in
+            self?.presentAddAnchorDialog(transform: transform)
+        }
+    }
+
+    // Step 3: gather anchor details and create the anchor at the raycast result.
+    private func presentAddAnchorDialog(transform: simd_float4x4?) {
+        let dialog = AddAnchorViewController(transform: transform) { [weak self] name, withARAnchor, withAnchorEntity, target in
+            self?.viewModel.placeUserAnchor(
+                name: name,
+                withARAnchor: withARAnchor,
+                withAnchorEntity: withAnchorEntity,
+                entityTarget: target,
+                transform: transform
+            )
         }
         present(dialog, animated: true)
     }
@@ -935,6 +1010,21 @@ final class ARWorldTrackingViewController: UIViewController {
 
         contentStackView.addArrangedSubview(makeDivider())
 
+        let sceneReconstructionOptions: [(title: String, value: ARWorldTrackingConfiguration.SceneReconstruction)] = [
+            ("none", []),
+            ("mesh", .mesh),
+            ("meshWithClassification", .meshWithClassification)
+        ]
+        sceneReconstructionChipGroupIndex = chipGroups.count
+        contentStackView.addArrangedSubview(makeChipsSection(
+            propertyName: "sceneReconstruction",
+            options: sceneReconstructionOptions,
+            selected: viewModel.sceneReconstruction,
+            onSelect: { [weak self] value in self?.viewModel.sceneReconstruction = value }
+        ))
+
+        contentStackView.addArrangedSubview(makeDivider())
+
         lightEstimationSwitch.isOn = viewModel.isLightEstimationEnabled
         lightEstimationSwitch.addAction(UIAction { [weak self] _ in
             self?.viewModel.isLightEstimationEnabled = self?.lightEstimationSwitch.isOn ?? false
@@ -963,6 +1053,18 @@ final class ARWorldTrackingViewController: UIViewController {
 
         contentStackView.addArrangedSubview(makeGroupHeader("ARSession.RunOptions"))
         contentStackView.addArrangedSubview(makeRunOptionsSection())
+
+        contentStackView.addArrangedSubview(makeDivider())
+
+        contentStackView.addArrangedSubview(makeGroupHeader("ARView.Environment"))
+        collisionSwitch.isOn = viewModel.isCollisionEnabled
+        collisionSwitch.addAction(UIAction { [weak self] _ in
+            self?.viewModel.isCollisionEnabled = self?.collisionSwitch.isOn ?? false
+        }, for: .valueChanged)
+        contentStackView.addArrangedSubview(makeToggleSection(
+            propertyName: "sceneUnderstanding",
+            rows: [("collision", collisionSwitch)]
+        ))
 
         contentStackView.addArrangedSubview(makeButtonRow(
             titles: ["Remove All Anchors", "Reset Tracking"],

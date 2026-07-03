@@ -5,15 +5,18 @@
 //  Created by Yafonia Hutabarat on 02/07/26.
 //
 
-import simd
+import ARKit
 import UIKit
 
-// A centered, non-draggable dialog for creating an anchor at a raycast hit. Lets the
-// user name it and toggle whether it is backed by an ARAnchor (a radio, on by
-// default). onAdd delivers (name, useARAnchor).
+// A centered, non-draggable dialog for creating an anchor. It shows the raycast result
+// transform (computed before this dialog), lets the user name the anchor, pick the
+// AnchorEntity target (World/Plane/Camera), and choose whether it is backed by an
+// ARAnchor and/or an AnchorEntity (two checkboxes, both on by default, at least one
+// required; "With ARAnchor" is disabled for Plane/Camera). onAdd delivers
+// (name, withARAnchor, withAnchorEntity, target).
 final class AddAnchorViewController: UIViewController {
-    private let transform: simd_float4x4
-    private let onAdd: (String, Bool) -> Void
+    private let onAdd: (String, Bool, Bool, AnchorEntityTarget) -> Void
+    private let transform: simd_float4x4?
 
     private let card: UIView = {
         let view = UIView()
@@ -34,22 +37,33 @@ final class AddAnchorViewController: UIViewController {
         return field
     }()
 
-    private let arAnchorRadio: UIButton = {
+    private let targetControl: UISegmentedControl = {
+        let control = UISegmentedControl(items: ["World", "Plane", "Camera"])
+        control.selectedSegmentIndex = AnchorEntityTarget.world.rawValue
+        return control
+    }()
+
+    private let arAnchorCheckbox = AddAnchorViewController.makeCheckbox(title: "With ARAnchor")
+    private let anchorEntityCheckbox = AddAnchorViewController.makeCheckbox(title: "With AnchorEntity")
+
+    // Square imagery signals these are multi-select checkboxes (not radios).
+    private static func makeCheckbox(title: String) -> UIButton {
         var config = UIButton.Configuration.plain()
-        config.title = "With ARAnchor"
-        config.image = UIImage(systemName: "largecircle.fill.circle")
+        config.title = title
+        config.image = UIImage(systemName: "checkmark.square.fill")
         config.imagePadding = 8
         config.contentInsets = NSDirectionalEdgeInsets(top: 6, leading: 0, bottom: 6, trailing: 0)
         let button = UIButton(configuration: config)
         button.contentHorizontalAlignment = .leading
         button.isSelected = true
         button.configurationUpdateHandler = { btn in
-            btn.configuration?.image = UIImage(systemName: btn.isSelected ? "largecircle.fill.circle" : "circle")
+            let name = btn.isSelected ? "checkmark.square.fill" : "square"
+            btn.configuration?.image = UIImage(systemName: name)
         }
         return button
-    }()
+    }
 
-    init(transform: simd_float4x4, onAdd: @escaping (String, Bool) -> Void) {
+    init(transform: simd_float4x4?, onAdd: @escaping (String, Bool, Bool, AnchorEntityTarget) -> Void) {
         self.transform = transform
         self.onAdd = onAdd
         super.init(nibName: nil, bundle: nil)
@@ -66,10 +80,38 @@ final class AddAnchorViewController: UIViewController {
         super.viewDidLoad()
         view.backgroundColor = UIColor.black.withAlphaComponent(0.4)
         nameField.delegate = self
-        arAnchorRadio.addAction(UIAction { [weak self] _ in
-            self?.arAnchorRadio.isSelected.toggle()
+        arAnchorCheckbox.addAction(UIAction { [weak self] _ in
+            guard let self else { return }
+            self.toggle(self.arAnchorCheckbox, other: self.anchorEntityCheckbox)
         }, for: .touchUpInside)
+        anchorEntityCheckbox.addAction(UIAction { [weak self] _ in
+            guard let self else { return }
+            self.toggle(self.anchorEntityCheckbox, other: self.arAnchorCheckbox)
+        }, for: .touchUpInside)
+        targetControl.addAction(UIAction { [weak self] _ in
+            self?.updateARAnchorAvailability()
+        }, for: .valueChanged)
         setupContent()
+        updateARAnchorAvailability()
+    }
+
+    // Toggle a checkbox, but keep at least one selected.
+    private func toggle(_ box: UIButton, other: UIButton) {
+        if box.isSelected && !other.isSelected { return }
+        box.isSelected.toggle()
+    }
+
+    // Plane / Camera targets cannot be backed by a plain ARAnchor(transform:), so
+    // "With ARAnchor" is disabled and cleared for those (and "With AnchorEntity" is
+    // forced on, since at least one is required); World re-enables both.
+    private func updateARAnchorAvailability() {
+        let isWorld = targetControl.selectedSegmentIndex == AnchorEntityTarget.world.rawValue
+        arAnchorCheckbox.isEnabled = isWorld
+        if !isWorld {
+            arAnchorCheckbox.isSelected = false
+            anchorEntityCheckbox.isSelected = true
+        }
+        anchorEntityCheckbox.isEnabled = isWorld
     }
 
     override func viewDidAppear(_ animated: Bool) {
@@ -82,17 +124,11 @@ final class AddAnchorViewController: UIViewController {
         titleLabel.text = "Add Anchor"
         titleLabel.font = .preferredFont(forTextStyle: .headline)
 
-        let position = transform.columns.3
         let transformLabel = UILabel()
-        transformLabel.text = String(
-            format: "Transform  x: %.3f, y: %.3f, z: %.3f",
-            position.x,
-            position.y,
-            position.z
-        )
-        transformLabel.font = .preferredFont(forTextStyle: .caption1)
-        transformLabel.textColor = .secondaryLabel
+        transformLabel.text = transformText(transform)
         transformLabel.numberOfLines = 0
+        transformLabel.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+        transformLabel.textColor = .secondaryLabel
 
         let cancelButton = UIButton(configuration: .gray())
         cancelButton.configuration?.title = "Cancel"
@@ -107,11 +143,19 @@ final class AddAnchorViewController: UIViewController {
         buttonRow.distribution = .fillEqually
         buttonRow.spacing = 12
 
+        let targetCaption = UILabel()
+        targetCaption.text = "AnchorEntity target"
+        targetCaption.font = .preferredFont(forTextStyle: .caption1)
+        targetCaption.textColor = .secondaryLabel
+
         let stack = UIStackView(arrangedSubviews: [
             titleLabel,
             transformLabel,
             nameField,
-            arAnchorRadio,
+            targetCaption,
+            targetControl,
+            arAnchorCheckbox,
+            anchorEntityCheckbox,
             buttonRow
         ])
         stack.axis = .vertical
@@ -142,13 +186,20 @@ final class AddAnchorViewController: UIViewController {
         ])
     }
 
+    private func transformText(_ t: simd_float4x4?) -> String {
+        guard let t else { return "Raycast result: no surface found" }
+        let p = t.columns.3
+        return String(format: "Raycast result\nx %.3f  y %.3f  z %.3f", p.x, p.y, p.z)
+    }
+
     private func submit() {
         let name = nameField.text ?? ""
         guard !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             nameField.becomeFirstResponder()
             return
         }
-        onAdd(name, arAnchorRadio.isSelected)
+        let target = AnchorEntityTarget(rawValue: targetControl.selectedSegmentIndex) ?? .world
+        onAdd(name, arAnchorCheckbox.isSelected, anchorEntityCheckbox.isSelected, target)
         dismiss(animated: true)
     }
 }

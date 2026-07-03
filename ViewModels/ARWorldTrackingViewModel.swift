@@ -18,6 +18,36 @@ struct ARWorldTrackingDisplayState {
     var lightEstimate: String
 }
 
+// Anchoring target for an AnchorEntity-only (render-only) user anchor. .plane and
+// .camera attach to detected surfaces / the camera, so they cannot be backed by a
+// plain ARAnchor(transform:).
+enum AnchorEntityTarget: Int, CaseIterable {
+    case world, plane, camera
+}
+
+// How a tap is turned into a world position before an anchor is placed.
+enum RaycastMethod: Int, CaseIterable {
+    case sessionRaycast, sessionTrackedRaycast, arViewRaycast, sceneRaycast, sceneRaycastLiDAR
+
+    var title: String {
+        switch self {
+        case .sessionRaycast: "ARSession.raycast"
+        case .sessionTrackedRaycast: "ARSession.trackedRaycast"
+        case .arViewRaycast: "ARView.raycast"
+        case .sceneRaycast: "ARView.scene.raycast (no LiDAR mesh)"
+        case .sceneRaycastLiDAR: "ARView.scene.raycast (with LiDAR mesh)"
+        }
+    }
+
+    // Only these consume an ARRaycastQuery.Target; the scene.raycast methods do not.
+    var usesRaycastTarget: Bool {
+        switch self {
+        case .sessionRaycast, .sessionTrackedRaycast, .arViewRaycast: true
+        case .sceneRaycast, .sceneRaycastLiDAR: false
+        }
+    }
+}
+
 // Read-only snapshot of a session anchor (the source of truth).
 struct InspectorARAnchor {
     let type: String
@@ -55,8 +85,18 @@ final class ARWorldTrackingViewModel: NSObject {
         didSet { applyConfigurationChange() }
     }
 
-    var isLightEstimationEnabled = true {
+    var isLightEstimationEnabled = false {
         didSet { applyConfigurationChange() }
+    }
+
+    var sceneReconstruction: ARWorldTrackingConfiguration.SceneReconstruction = [] {
+        didSet { applyConfigurationChange() }
+    }
+
+    // ARView.Environment.SceneUnderstanding.collision. Enables collision shapes on the
+    // reconstructed mesh so it can be raycast against.
+    var isCollisionEnabled = false {
+        didSet { updateSceneUnderstanding() }
     }
 
     // ARView debug visualizations. World origin starts on to match prior behavior.
@@ -79,20 +119,30 @@ final class ARWorldTrackingViewModel: NSObject {
     // Render-only projection of the session's anchors, keyed by ARAnchor.identifier.
     // ARAnchor is the source of truth; these AnchorEntity values exist purely to draw.
     private var renderedAnchors: [UUID: AnchorEntity] = [:]
+    // ARAnchor identifiers created "with ARAnchor, without AnchorEntity": the delegate
+    // skips their render projection so they exist in the session but are not rendered.
+    private var unrenderedARAnchorIDs: Set<UUID> = []
     // Add-order of scene entities (newest last); drives newest-first inspector lists.
     // Keyed by entity identity so world (ARAnchor-less) entities are ordered too.
     private var sceneOrder: [ObjectIdentifier] = []
     // Render-only anchors the user created without a backing ARAnchor, for cleanup.
     private var unanchoredEntities: [AnchorEntity] = []
-    private var reflectionProbe: AnchorEntity?
     private var lastLightEstimate = "-"
+    // Retained while a tracked raycast is in flight; stopped after its first result.
+    private var trackedRaycast: ARTrackedRaycast?
+    // Palette cycled so each user-created anchor marker gets a distinct color.
+    private static let userAnchorColors: [UIColor] = [
+        .systemRed, .systemOrange, .systemYellow, .systemGreen,
+        .systemTeal, .systemBlue, .systemIndigo, .systemPurple, .systemPink
+    ]
+    private var nextUserAnchorColorIndex = 0
 
     func attach(to arView: ARView) {
         self.arView = arView
         arView.session.delegate = self
         updateDebugOptions()
+        updateSceneUnderstanding()
         reconfigure()
-        updateReflectionProbe()
         notifyAnchorsChanged()
     }
 
@@ -104,7 +154,6 @@ final class ARWorldTrackingViewModel: NSObject {
         }
         updateConfiguration()
         arView.session.run(configuration, options: runOptions)
-        updateReflectionProbe()
         publishDisplayState(cameraTransform: "-", trackingState: "-")
     }
 
@@ -160,41 +209,138 @@ final class ARWorldTrackingViewModel: NSObject {
             configuration,
             options: [.resetTracking, .removeExistingAnchors]
         )
-        updateReflectionProbe()
         publishDisplayState(cameraTransform: "-", trackingState: "-")
     }
 
-    func handleTap(at point: CGPoint, in arView: ARView) -> TapHandleResult {
-        if let entity = arView.entity(at: point),
-           let info = anchorInfo(for: entity) {
-            return .existingAnchor(info)
-        }
-
-        if let transform = RaycastPlaceholder.performRaycast(at: point, in: arView) {
-            return .raycastHit(transform)
-        }
-
-        return .noHit
+    // Info-only lookup: returns the tapped anchor's info, or nil for empty space.
+    // Placement is deferred until after the raycast-method and add-anchor dialogs.
+    func anchorInfoAtTap(at point: CGPoint, in arView: ARView) -> AnchorTapInfo? {
+        guard let entity = arView.entity(at: point) else { return nil }
+        return anchorInfo(for: entity)
     }
 
-    func addUserAnchor(name: String, transform: simd_float4x4, useARAnchor: Bool = true) {
+    // Runs the chosen raycast for `point`. The result transform is shown in the Add
+    // Anchor dialog before placeUserAnchor creates the anchor.
+    func raycast(
+        method: RaycastMethod,
+        target: ARRaycastQuery.Target,
+        at point: CGPoint,
+        completion: @escaping (simd_float4x4?) -> Void
+    ) {
+        performRaycast(method: method, target: target, at: point, completion: completion)
+    }
+
+    // Creates the anchor at an already-computed transform (from raycast(...)).
+    func placeUserAnchor(
+        name: String,
+        withARAnchor: Bool,
+        withAnchorEntity: Bool,
+        entityTarget: AnchorEntityTarget,
+        transform: simd_float4x4?
+    ) {
+        // Render-only .plane/.camera anchors ignore the transform, so identity is fine
+        // if the raycast found nothing.
+        let resolved = transform ?? ((!withARAnchor && entityTarget != .world) ? matrix_identity_float4x4 : nil)
+        guard let resolved else { return }
+        addUserAnchor(
+            name: name,
+            transform: resolved,
+            withARAnchor: withARAnchor,
+            withAnchorEntity: withAnchorEntity,
+            target: entityTarget
+        )
+    }
+
+    private func performRaycast(
+        method: RaycastMethod,
+        target: ARRaycastQuery.Target,
+        at point: CGPoint,
+        completion: @escaping (simd_float4x4?) -> Void
+    ) {
+        guard let arView else { return completion(nil) }
+        switch method {
+        case .sessionRaycast:
+            guard let query = arView.makeRaycastQuery(from: point, allowing: target, alignment: .any) else {
+                return completion(nil)
+            }
+            completion(arView.session.raycast(query).first?.worldTransform)
+        case .sessionTrackedRaycast:
+            guard let query = arView.makeRaycastQuery(from: point, allowing: target, alignment: .any) else {
+                return completion(nil)
+            }
+            trackedRaycast = arView.session.trackedRaycast(query) { [weak self] results in
+                guard let self, let transform = results.first?.worldTransform else { return }
+                self.trackedRaycast?.stopTracking()
+                self.trackedRaycast = nil
+                completion(transform)
+            }
+        case .arViewRaycast:
+            completion(arView.raycast(from: point, allowing: target, alignment: .any).first?.worldTransform)
+        case .sceneRaycast, .sceneRaycastLiDAR:
+            // Collision raycast against the scene. With LiDAR mesh (enableLiDARMesh) this
+            // hits the reconstructed environment; without it, only entities that have
+            // collision shapes.
+            guard let ray = arView.ray(through: point),
+                  let hit = arView.scene.raycast(
+                    origin: ray.origin,
+                    direction: ray.direction,
+                    length: 10,
+                    query: .nearest
+                  ).first else {
+                return completion(nil)
+            }
+            var transform = matrix_identity_float4x4
+            transform.columns.3 = SIMD4<Float>(hit.position, 1)
+            completion(transform)
+        }
+    }
+
+    // Turns on both scene reconstruction and mesh collision, then reruns the session
+    // (via sceneReconstruction's didSet) so the LiDAR mesh can be raycast against.
+    func enableLiDARMesh() {
+        sceneReconstruction = .mesh
+        isCollisionEnabled = true
+    }
+
+    func addUserAnchor(
+        name: String,
+        transform: simd_float4x4,
+        withARAnchor: Bool = true,
+        withAnchorEntity: Bool = true,
+        target: AnchorEntityTarget = .world
+    ) {
         guard let arView else { return }
 
         let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedName.isEmpty else { return }
 
-        if useARAnchor {
+        if withARAnchor {
             // Add a real, named session anchor. The delegate builds its render entity, so
             // user anchors and ARKit-detected planes flow through the exact same path and
-            // the ARAnchor remains the single source of truth.
+            // the ARAnchor remains the single source of truth. When there is no
+            // AnchorEntity, flag the id so the delegate skips its render projection.
             let arAnchor = ARAnchor(name: trimmedName, transform: transform)
+            if !withAnchorEntity { unrenderedARAnchorIDs.insert(arAnchor.identifier) }
             arView.session.add(anchor: arAnchor)
         } else {
-            // Render-only anchor: a world-anchored AnchorEntity with no backing ARAnchor.
-            // It lives purely in the scene, so we track it for reset/remove-all cleanup.
-            let entity = AnchorEntity(.world(transform: transform))
+            // Render-only anchor: an AnchorEntity with no backing ARAnchor. It lives purely
+            // in the scene, so we track it for reset/remove-all cleanup. .plane and .camera
+            // attach to detected surfaces / the camera and ignore `transform`.
+            let entity: AnchorEntity
+            switch target {
+            case .world:
+                entity = AnchorEntity(.world(transform: transform))
+            case .plane:
+                entity = AnchorEntity(.plane(.horizontal, classification: .any, minimumBounds: SIMD2<Float>(0.2, 0.2)))
+            case .camera:
+                entity = AnchorEntity(.camera)
+            }
             entity.name = trimmedName
-            entity.addChild(makeUserAnchorMarker())
+            let marker = makeUserAnchorMarker()
+            // A .camera marker at the origin sits on the camera and is not visible, so
+            // push it forward into view.
+            if case .camera = target { marker.position = [0, 0, -0.5] }
+            entity.addChild(marker)
             unanchoredEntities.append(entity)
             addSceneAnchor(entity)
             notifyAnchorsChanged()
@@ -202,16 +348,28 @@ final class ARWorldTrackingViewModel: NSObject {
     }
 
     func anchorInfo(for entity: Entity) -> AnchorTapInfo? {
-        guard let anchorEntity = anchorEntity(from: entity),
-              let id = renderedAnchors.first(where: { $0.value === anchorEntity })?.key,
-              let anchor = arView?.session.currentFrame?.anchors.first(where: { $0.identifier == id })
-        else { return nil }
+        guard let anchorEntity = anchorEntity(from: entity) else { return nil }
 
-        return AnchorTapInfo(
-            name: displayName(for: anchor),
-            uuid: anchor.identifier,
-            transform: anchor.transform
-        )
+        // ARAnchor-backed anchor (user anchor or detected plane): the ARAnchor is truth.
+        if let id = renderedAnchors.first(where: { $0.value === anchorEntity })?.key,
+           let anchor = arView?.session.currentFrame?.anchors.first(where: { $0.identifier == id }) {
+            return AnchorTapInfo(
+                name: displayName(for: anchor),
+                uuid: anchor.identifier,
+                transform: anchor.transform
+            )
+        }
+
+        // Render-only anchor (world/plane/camera AnchorEntity with no backing ARAnchor).
+        if unanchoredEntities.contains(where: { $0 === anchorEntity }) {
+            return AnchorTapInfo(
+                name: anchorEntity.name,
+                uuid: anchorEntity.anchorIdentifier,
+                transform: anchorEntity.transformMatrix(relativeTo: nil)
+            )
+        }
+
+        return nil
     }
 
     // Snapshot of the session's anchors (the source of truth) for the inspector,
@@ -304,7 +462,6 @@ final class ARWorldTrackingViewModel: NSObject {
 
     private func applyConfigurationChange() {
         guard arView != nil else { return }
-        updateReflectionProbe()
         reconfigure()
     }
 
@@ -316,10 +473,14 @@ final class ARWorldTrackingViewModel: NSObject {
         else { arView.debugOptions.remove(.showWorldOrigin) }
     }
 
+    private func updateSceneUnderstanding() {
+        guard let arView else { return }
+        if isCollisionEnabled { arView.environment.sceneUnderstanding.options.insert(.collision) }
+        else { arView.environment.sceneUnderstanding.options.remove(.collision) }
+    }
+
     private func updateConfiguration() {
         configuration.worldAlignment = worldAlignment
-        configuration.environmentTexturing = environmentTexturing
-        configuration.isLightEstimationEnabled = isLightEstimationEnabled
 
         var planeDetection: ARWorldTrackingConfiguration.PlaneDetection = []
         if isHorizontalPlaneDetectionEnabled {
@@ -329,6 +490,9 @@ final class ARWorldTrackingViewModel: NSObject {
             planeDetection.insert(.vertical)
         }
         configuration.planeDetection = planeDetection
+
+        configuration.sceneReconstruction =
+            ARWorldTrackingConfiguration.supportsSceneReconstruction(sceneReconstruction) ? sceneReconstruction : []
     }
 
     private func isDetectionEnabled(for alignment: ARPlaneAnchor.Alignment) -> Bool {
@@ -403,42 +567,10 @@ final class ARWorldTrackingViewModel: NSObject {
 
     private func makeUserAnchorMarker() -> ModelEntity {
         let mesh = MeshResource.generateSphere(radius: 0.02)
-        let material = SimpleMaterial(color: UIColor.systemOrange.withAlphaComponent(0.9), isMetallic: false)
+        let color = Self.userAnchorColors[nextUserAnchorColorIndex % Self.userAnchorColors.count]
+        nextUserAnchorColorIndex += 1
+        let material = SimpleMaterial(color: color.withAlphaComponent(0.9), isMetallic: false)
         return ModelEntity(mesh: mesh, materials: [material])
-    }
-
-    // Shows the reflection probe only while environment texturing is active. Under
-    // .none it has nothing to reflect (it renders as a black sphere in the middle),
-    // so we keep it out of the scene. Guarding on `scene` keeps this idempotent, so
-    // it also re-adds the probe if a scene wipe / tracking reset detached it.
-    private func updateReflectionProbe() {
-        guard let arView else { return }
-
-        guard environmentTexturing != .none else {
-            if let probe = reflectionProbe {
-                removeSceneAnchor(probe)
-                reflectionProbe = nil
-            }
-            return
-        }
-
-        if reflectionProbe?.scene == nil {
-            let probe = makeReflectionProbe()
-            reflectionProbe = probe
-            addSceneAnchor(probe)
-        }
-    }
-
-    // A mirror-like sphere kept in front of the camera. environmentTexturing feeds the
-    // reflections it shows: flat under .none, mirroring the room under .automatic.
-    private func makeReflectionProbe() -> AnchorEntity {
-        let anchor = AnchorEntity(.camera)
-        anchor.name = "reflection-probe"
-        let material = SimpleMaterial(color: .white, roughness: 0.05, isMetallic: true)
-        let sphere = ModelEntity(mesh: .generateSphere(radius: 0.05), materials: [material])
-        sphere.position = [0, 0, -0.5]
-        anchor.addChild(sphere)
-        return anchor
     }
 
     private func anchorEntity(from entity: Entity) -> AnchorEntity? {
@@ -590,9 +722,12 @@ extension ARWorldTrackingViewModel: ARSessionDelegate {
     nonisolated func session(_ session: ARSession, didAdd anchors: [ARAnchor]) {
         Task { @MainActor in
             for anchor in anchors {
+                session.currentFrame?.anchors
                 // Environment probe anchors are non-visual data anchors (they carry the
                 // environment cube-map for reflections), so no render projection.
                 if anchor is AREnvironmentProbeAnchor { continue }
+                // ARAnchor-only anchors (created without an AnchorEntity) are not rendered.
+                if unrenderedARAnchorIDs.remove(anchor.identifier) != nil { continue }
                 let entity = renderEntity(for: anchor)
                 renderedAnchors[anchor.identifier] = entity
                 addSceneAnchor(entity)

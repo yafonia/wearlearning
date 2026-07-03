@@ -20,6 +20,8 @@
 		843E31032FF68ECD00D9E33C /* HomeCardCell.swift in Sources */ = {isa = PBXBuildFile; fileRef = 843E30F32FF68ECD00D9E33C /* HomeCardCell.swift */; };
 		843E31042FF68ECD00D9E33C /* ARWorldTrackingViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 843E30ED2FF68ECD00D9E33C /* ARWorldTrackingViewModel.swift */; };
 		843E31052FF68ECD00D9E33C /* HomeViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 843E30F42FF68ECD00D9E33C /* HomeViewController.swift */; };
+		843E31072FF837F200D9E33C /* RaycastMethodViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 843E31062FF837EC00D9E33C /* RaycastMethodViewController.swift */; };
+		843E31092FF8380700D9E33C /* RaycastTargetViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 843E31082FF8380100D9E33C /* RaycastTargetViewController.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -36,6 +38,8 @@
 		843E30F32FF68ECD00D9E33C /* HomeCardCell.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HomeCardCell.swift; sourceTree = "<group>"; };
 		843E30F42FF68ECD00D9E33C /* HomeViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HomeViewController.swift; sourceTree = "<group>"; };
 		843E30F62FF68ECD00D9E33C /* PlaceholderDetailViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlaceholderDetailViewController.swift; sourceTree = "<group>"; };
+		843E31062FF837EC00D9E33C /* RaycastMethodViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RaycastMethodViewController.swift; sourceTree = "<group>"; };
+		843E31082FF8380100D9E33C /* RaycastTargetViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RaycastTargetViewController.swift; sourceTree = "<group>"; };
 		848A497C2FEF9CD4000F14DC /* WeAReLearning.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = WeAReLearning.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
@@ -88,6 +92,8 @@
 		843E30F22FF68ECD00D9E33C /* ARWorldTracking */ = {
 			isa = PBXGroup;
 			children = (
+				843E31082FF8380100D9E33C /* RaycastTargetViewController.swift */,
+				843E31062FF837EC00D9E33C /* RaycastMethodViewController.swift */,
 				843E30F02FF68ECD00D9E33C /* AddAnchorViewController.swift */,
 				843E30F12FF68ECD00D9E33C /* ARWorldTrackingViewController.swift */,
 			);
@@ -217,7 +223,9 @@
 				843E30FA2FF68ECD00D9E33C /* PlaceholderDetailViewController.swift in Sources */,
 				843E30FB2FF68ECD00D9E33C /* AddAnchorViewController.swift in Sources */,
 				843E30FC2FF68ECD00D9E33C /* RaycastPlaceholder.swift in Sources */,
+				843E31072FF837F200D9E33C /* RaycastMethodViewController.swift in Sources */,
 				843E30FD2FF68ECD00D9E33C /* SceneDelegate.swift in Sources */,
+				843E31092FF8380700D9E33C /* RaycastTargetViewController.swift in Sources */,
 				843E30FE2FF68ECD00D9E33C /* AnchorTapInfo.swift in Sources */,
 				843E30FF2FF68ECD00D9E33C /* ARCardItem.swift in Sources */,
 				843E31002FF68ECD00D9E33C /* AppDelegate.swift in Sources */,

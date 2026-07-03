@@ -10,7 +10,7 @@ import simd
 
 struct AnchorTapInfo {
     let name: String
-    let uuid: UUID
+    let uuid: UUID?
     let transform: simd_float4x4
 
     var transformDescription: String {
@@ -22,10 +22,4 @@ struct AnchorTapInfo {
             position.z
         )
     }
-}
-
-enum TapHandleResult {
-    case existingAnchor(AnchorTapInfo)
-    case raycastHit(simd_float4x4)
-    case noHit
 }
